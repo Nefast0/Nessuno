@@ -1,5 +1,4 @@
 import os, sys
-import base64
 from datetime import datetime
 from Config import Config
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -7,6 +6,7 @@ from cryptography.hazmat.primitives import serialization, padding, hashes, hmac
 from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 
 
 class Crypto:
@@ -36,7 +36,6 @@ class Crypto:
 
     @staticmethod
     def encrypt(plain_text):
-        backend = default_backend()
         AESkey = os.urandom(16)
         AESiv = os.urandom(16)
 
@@ -45,14 +44,13 @@ class Crypto:
         # Generate Content
 
         # prepend datetime
-        plain_text = datetime.utcnow().strftime('%y%m%d%H%M%S') + plain_text
+        plain_text = datetime.utcnow().strftime('%y%m%d%H%M%SZ') + plain_text
         # padding
         padder = padding.PKCS7(128).padder()
         padded_text = padder.update(plain_text)
         padded_text += padder.finalize()
         # encrypt
-        cipher = Cipher(algorithms.AES(AESkey), modes.CBC(AESiv), backend=backend)
-        encryptor = cipher.encryptor()
+        encryptor = Cipher(algorithms.AES(AESkey), modes.CBC(AESiv), backend=default_backend()).encryptor()
         encrypted_message = encryptor.update(padded_text) + encryptor.finalize()
         # prepend IV
         content = AESiv + encrypted_message
@@ -77,29 +75,115 @@ class Crypto:
             hashes.SHA1()
         )
 
-        header = 'NESS' + Crypto.fingerprint + signed_keys + keys
+        header = b'NESS' + Crypto.fingerprint + signed_keys + keys
 
         # encrypt header
         # header is too long so we split it encrypt each block and then merge
 
         # split bytes
-        first_half = header[:214]
-        second_half = header[214:]
+        first_half = header[:158]
+        second_half = header[158:]
 
-        encrypted_header = Crypto.publicKey.encrypt(
-            header,
+        # the key used should be the recipient's public key, however
+        # for testing purposes we will use our own key so that we can decrypt and test this module
+        encrypted_header_1 = Crypto.publicKey.encrypt(
+            first_half,
             asymmetric_padding.OAEP(
                 mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA1()),
                 algorithm=hashes.SHA1(),
                 label=None
             )
         )
+        encrypted_header_2 = Crypto.publicKey.encrypt(
+            second_half,
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None
+            )
+        )
+        # build full packet
+        full_packet = encrypted_header_1 + encrypted_header_2 + h + content
+        return full_packet
 
-        # build encrypted packet
-        return header + hmac + content
 
-    def decrypt(self, encrypted_text):
-        pass
+    @staticmethod
+    def decrypt(encrypted_message):
+        # The header is two blocks 256-byte long but we only need the first block to verify the 'NESS' flag
+        encrypted_first_half = encrypted_message[:256]
+        try:
+            first_half_header = Crypto.privateKey.decrypt(
+                encrypted_first_half,
+                asymmetric_padding.OAEP(
+                    mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA1()),
+                    algorithm=hashes.SHA1(),
+                    label=None
+                )
+            )
+
+            if first_half_header[:4] == 'NESS':
+                print 'Packet opened'
+            else:
+                raise ValueError('Nessuno flag not found')
+
+            # Decrypt second half of the header
+            encrypted_second_half = encrypted_message[256:512]
+            second_half_header = Crypto.privateKey.decrypt(
+                encrypted_second_half,
+                asymmetric_padding.OAEP(
+                    mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA1()),
+                    algorithm=hashes.SHA1(),
+                    label=None
+                )
+            )
+            header = first_half_header + second_half_header
+            # now we retrieve the HMAC key and AES key and we verify the signed hash
+            # hmac key is 20 bytes
+            hmac_key = header[-36:-16]
+
+            # aes key is 16 bytes
+            aes_key = header[-16:]
+
+            # get the signature [256 bytes]
+            signature = header[24:280]
+
+            # verify signature on keys
+            keys = hmac_key + aes_key
+
+            Crypto.publicKey.verify(
+                signature,
+                keys,
+                asymmetric_padding.PSS(
+                    mgf=asymmetric_padding.MGF1(hashes.SHA1()),
+                    salt_length=asymmetric_padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA1()
+            )
+            print 'Signature is valid'
+
+            # get the content block which is after the padded header[512 bytes] and HMAC[20 bytes]
+            content_block = encrypted_message[532:]
+            iv = content_block[:16]
+            message = content_block[16:]
+            # use the aes key with the IV to decrypt the message
+            decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend()).decryptor()
+
+            paddedText = decryptor.update(message) + decryptor.finalize()
+
+            # finally we remove the padding
+            unpadder = padding.PKCS7(128).unpadder()
+            plain_text = unpadder.update(paddedText) + unpadder.finalize()
+            return plain_text
+
+        except InvalidSignature:
+            print "Packet is invalid"
+            # should not forward
+            raise Exception('Invalid packet')
+
+        except ValueError:
+            print 'Decryption failed, forwarding...'
+            # call method to forward the packet
+            return False
 
     def insertKey(self, key):
         gpg = gnupg.GPG()
@@ -115,16 +199,6 @@ class Crypto:
             email = s[s.find('<') + 1:s.rfind('>')]
             keys[email] = key['fingerprint']
         return keys
-
-    def exportPublicKey(self, key):
-        gpg = gnupg.GPG()
-        ascii_armored_public_keys = gpg.export_keys(key)
-        return ascii_armored_public_keys
-
-    def importPublicKey(self, key):
-        gpg = gnupg.GPG()
-        result = gpg.import_keys(key)
-        # pprint(result.results)
 
     @staticmethod
     def loadKeys():
@@ -146,8 +220,18 @@ class Crypto:
             format=serialization.PublicFormat.SubjectPublicKeyInfo))
         Crypto.fingerprint = digest.finalize()
 
-
+# TEST CRYPTOGRAPHY
 if __name__ == "__main__":
+    # load keys
     Crypto.loadKeys()
-    x = Crypto.encrypt('hello secret')
-    print x
+    # encrypt 'hello secret'
+    encrypted = Crypto.encrypt(b'hello secret')
+    print 'Encrypted message:\n' + encrypted
+    # decrypt message
+    decrypted = Crypto.decrypt(encrypted)
+    if decrypted:
+        # strip off the time
+        time = decrypted[:13]
+        time = datetime.strptime(time, '%y%m%d%H%M%SZ').strftime('%d/%b/y %H:%M:%S')
+        text = decrypted[13:]
+        print 'Message\n' + time + ': ' + text
