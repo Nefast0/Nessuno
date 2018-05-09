@@ -232,6 +232,6 @@ if __name__ == "__main__":
     if decrypted:
         # strip off the time
         time = decrypted[:13]
-        time = datetime.strptime(time, '%y%m%d%H%M%SZ').strftime('%d/%b/y %H:%M:%S')
+        time = datetime.strptime(time, '%y%m%d%H%M%SZ').strftime('%d/%b/%y %H:%M:%S')
         text = decrypted[13:]
         print 'Message\n' + time + ': ' + text
